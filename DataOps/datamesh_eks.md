@@ -219,7 +219,7 @@ flowchart TB
 
 ---
 
-## 6. The Interview One-Liner
+## 6. The Summary One-Liner
 
 > *"Our Streaming EKS cluster handles real-time ingestion directly into the Central S3 Silver layer as Iceberg tables. The Batch EKS cluster is dedicated purely to table maintenance — Spark compaction jobs on that Silver layer to solve the small-file problem. The data is then federated out to Domain AWS Accounts, where domain-specific compute transforms Silver into Gold Data Products inside their own Redshift or Athena environments. For governance, all schemas are registered centrally in AWS Glue, which is automatically scraped by OpenMetadata running on our Management Cluster to provide an enterprise-wide data catalog."*
 
