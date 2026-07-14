@@ -80,11 +80,13 @@ flowchart LR
         MSK["Amazon MSK<br/>Serverless / Express / Provisioned"]
         Schema["AWS Glue Schema Registry"]
         Flink["Amazon Managed Service<br/>for Apache Flink"]
+        Curated["Amazon MSK<br/>Curated Topics"]
         Connect["Amazon MSK Connect<br/>Iceberg Sink / Integrations"]
         IoTBridge["IAM-Authenticated<br/>Producer Lambda"]
         MSK --> Flink
         Schema -. "Contracts" .-> MSK
-        Flink --> Connect
+        Flink --> Curated
+        Curated --> Connect
     end
 
     subgraph Lake["Governed S3 Iceberg Lakehouse"]
@@ -108,6 +110,7 @@ flowchart LR
     end
 
     subgraph Control["AWS-Native AI DataOps Control Plane"]
+        CW["Amazon CloudWatch<br/>Metrics and Alarms"]
         EventBridge["Amazon EventBridge"]
         SFN["AWS Step Functions"]
         Evidence["AWS Lambda<br/>Bounded Evidence APIs"]
@@ -129,10 +132,10 @@ flowchart LR
     IoT -. "For MSK Serverless" .-> IoTBridge
     IoTBridge --> MSK
 
-    Flink --> Bronze
-    Flink --> Silver
-    Flink --> Errors
-    Connect -. "Optional direct sink" .-> Bronze
+    Connect --> Bronze
+    Connect --> Silver
+    Connect --> Errors
+    Flink -. "Alternative tested<br/>direct Iceberg sink" .-> Silver
 
     Bronze --> Catalog
     Silver --> Catalog
@@ -150,8 +153,9 @@ flowchart LR
     Athena --> Silver
     Athena --> Gold
 
-    MSK --> EventBridge
-    Flink --> EventBridge
+    MSK --> CW
+    Flink --> CW
+    CW --> EventBridge
     GlueDQ --> EventBridge
     EventBridge --> SFN
     SFN --> Evidence
@@ -170,6 +174,41 @@ flowchart LR
     Gold --> BI
 ```
 
+### Recommended Reliable Baseline
+
+For the high-throughput production design, the preferred baseline is intentionally more specific than the general diagram:
+
+```text
+AWS IoT Core
+→ MSK Express or Provisioned
+→ Managed Service for Apache Flink
+→ curated MSK topics
+→ one MSK Connect Iceberg sink owner per target-table group
+→ S3 Iceberg + Glue Data Catalog + Lake Formation
+→ EMR Serverless for Gold dataset assembly and specialized maintenance
+```
+
+This choice provides clear failure boundaries:
+
+- MSK owns durable event transport and replay.
+- Flink owns stateful event-time computation, validation, and error-case classification.
+- Curated topics form the replayable contract between processing and storage delivery.
+- MSK Connect owns Iceberg commits for its assigned tables.
+- EMR Serverless owns batch dataset publication.
+- Glue optimizers own routine table maintenance.
+
+The alternative direct Flink-to-Iceberg path is valid when lower latency or atomic checkpoint-coupled table commits are required, but it must pass connector-version, checkpoint-recovery, schema-evolution, and concurrent-writer tests before production use.
+
+### Non-Negotiable Reliability Decisions
+
+1. **One authoritative streaming writer path per Iceberg table.** Do not let Flink, MSK Connect, Firehose, and Glue streaming jobs independently write the same table.
+2. **Immutable raw object keys.** Generate content-addressed or unique object keys; never rely on overwriting an existing S3 key during retry.
+3. **At-least-once boundaries require idempotency.** Lambda event-source mappings and many service integrations can deliver duplicates.
+4. **Exactly-once must be proven end to end.** Flink checkpoint consistency alone does not guarantee exactly-once external side effects unless the selected sink participates correctly.
+5. **Gold datasets are published by manifest.** Consumers see a dataset only after quality gates pass and the immutable Iceberg snapshot IDs are recorded.
+6. **AI never becomes a data-plane dependency.** A Bedrock or Step Functions outage cannot stop Kafka-to-Iceberg ingestion.
+7. **Recovery is tested, not inferred.** The implementation must demonstrate replay, duplicate suppression, checkpoint restore, failed Iceberg commit recovery, and regional failover procedures.
+
 ---
 
 ## 3. Ingress Design: Telemetry vs. Large Sensor Objects
@@ -181,8 +220,11 @@ Large camera, LiDAR, radar, and log objects should not travel as Kafka payloads.
 1. The edge agent requests an upload session from API Gateway.
 2. Lambda authenticates the device or fleet identity and generates narrowly scoped S3 presigned URLs.
 3. The edge agent uses multipart upload with checksums and resumable retry.
-4. The completed object is stored in an immutable S3 raw bucket.
-5. An S3 event or upload-completion API publishes the object manifest to MSK.
+4. The object key includes a unique upload ID or content hash so a retry cannot overwrite a different object.
+5. The completed object is stored in an immutable S3 raw bucket with versioning and the required retention policy.
+6. An S3 event or upload-completion API publishes the object manifest to MSK.
+
+The upload-completion operation is idempotent: DynamoDB conditionally records the upload ID, object key, checksum, and manifest-publication state. A retry returns the existing result instead of publishing a second logical object. S3 Object Lock is optional and should be enabled only where evidentiary or regulatory retention requires write-once-read-many controls.
 
 Example object manifest:
 
@@ -328,6 +370,26 @@ Managed Flink performs stateful real-time processing without a self-managed EKS 
 
 For a strong XPENG-aligned demonstration, use Managed Flink for error-case detection and event-time processing, then use either a tested Iceberg sink or a curated Kafka topic with MSK Connect.
 
+For the production baseline in this design, use **curated MSK topics plus MSK Connect**. Treat Data Firehose as a bounded alternative: use only one Firehose stream to write a given Iceberg table, configure an S3 error-output prefix and replay procedure, and verify the chosen source is supported. In particular, Firehose does not support MSK Serverless as a source when the destination is an Iceberg table. Multiple Firehose streams must not compete to commit to the same table because Iceberg optimistic concurrency permits only one successful commit at a time.
+
+### End-to-End Delivery Semantics
+
+"Exactly once" is a property of the complete source-processing-sink path, not a label applied to one service.
+
+| Boundary | Expected behavior | Required control |
+|---|---|---|
+| Edge upload → S3 | Network retry may repeat requests | Unique immutable object key, checksum, multipart upload ID, and conditional completion record |
+| IoT Core rule action | Intermittent failures can cause retry | Immutable `event_id` and downstream deduplication |
+| Lambda integration | At-least-once delivery is possible | Idempotent handler and conditional DynamoDB record |
+| Kafka producer → MSK | Retry can duplicate without producer controls | Producer idempotency, stable key, acknowledgments, and bounded retry |
+| MSK → Managed Flink | Offsets and state restore from checkpoints | Checkpointing, snapshots, stable operator IDs, and tested restore procedure |
+| Flink → curated Kafka | Exactly-once requires Kafka transaction support and correct checkpoint configuration | Transactional producer settings and failure-injection testing |
+| MSK Connect → Iceberg | Depends on the selected connector and configuration | Pin version, enable supported exactly-once mode, isolate table ownership, and test commit recovery |
+| Firehose → Iceberg | Managed retry with failed records routed to S3 | Error bucket, replay procedure, unique keys for updates/deletes, and one stream per table |
+| EMR Serverless → Gold | Job retry can repeat a write | Write to a run-specific staging branch/table and publish the manifest only once |
+
+Every stage carries `event_id`, source topic/partition/offset where applicable, upload ID, schema version, model version, and processing-run ID. A reconciliation job compares these identifiers across raw S3 objects, Kafka manifests, Silver records, and Gold manifests.
+
 ---
 
 ## 7. Amazon MSK Connect
@@ -363,8 +425,10 @@ flowchart LR
     Silver --> Error[("Silver Iceberg<br/>Model Error Cases")]
     Error --> Gold[("Gold Iceberg<br/>Training / Simulation Manifest")]
 
-    Flink["Managed Flink"] --> Bronze
-    Flink --> Silver
+    Flink["Managed Flink"] --> Curated["Curated MSK Topics"]
+    Curated --> Connect["MSK Connect<br/>Authoritative Streaming Writer"]
+    Connect --> Bronze
+    Connect --> Silver
     EMR["EMR Serverless"] --> Error
     EMR --> Gold
     Optimizer["Glue Table Optimizers"] -. "Compaction<br/>Snapshot Retention<br/>Orphan Cleanup" .-> Bronze
@@ -408,7 +472,7 @@ AWS Glue Data Catalog table optimizers can manage:
 2. **Snapshot retention:** Remove snapshots according to retention and minimum-snapshot policies.
 3. **Orphan-file deletion:** Remove unreferenced files after a safe retention window.
 
-Use EMR Serverless for specialized maintenance that requires custom Spark logic; use Glue optimizers for standard recurring maintenance.
+Glue managed compaction applies to supported Parquet-backed Iceberg tables. Use EMR Serverless for specialized maintenance, unsupported layouts, or logic that requires custom Spark code; use Glue optimizers for standard recurring maintenance after validating table and regional support.
 
 ---
 
@@ -605,9 +669,10 @@ sequenceDiagram
     participant I as IoT Core + S3
     participant K as Amazon MSK
     participant F as Managed Flink
+    participant W as Curated MSK + MSK Connect
     participant L as S3 Iceberg
     participant G as Glue / DataZone
-    participant C as Step Functions + Bedrock
+    participant A as Step Functions + Bedrock
     participant H as Human Reviewer
     participant E as EMR Serverless
     participant S as SageMaker / Simulation
@@ -615,14 +680,15 @@ sequenceDiagram
     V->>I: Upload objects and telemetry
     I->>K: Publish manifests and events
     K->>F: Consume ordered event streams
-    F->>L: Write validated events and error cases
+    F->>W: Publish validated events and error cases
+    W->>L: Commit to owned Iceberg tables
     L->>G: Register snapshots, schema, quality, and lineage
-    F->>C: Emit threshold or quality event
-    C->>G: Retrieve owner, lineage, and downstream impact
-    C->>C: Diagnose using metrics and approved runbooks
-    C->>H: Request bounded action approval
-    H-->>C: Approve dataset or remediation parameters
-    C->>E: Start compaction or dataset assembly job
+    F->>A: Emit threshold or quality event
+    A->>G: Retrieve owner, lineage, and downstream impact
+    A->>A: Diagnose using metrics and approved runbooks
+    A->>H: Request bounded action approval
+    H-->>A: Approve dataset or remediation parameters
+    A->>E: Start compaction or dataset assembly job
     E->>L: Publish versioned Gold manifest
     L->>S: Supply pinned snapshot for training/simulation
     S-->>L: Publish evaluation result and model version
@@ -691,7 +757,58 @@ Do not publish SLO numbers until tests establish realistic values.
 
 ---
 
-## 16. Failure Modes and Recovery
+## 16. Regional Resilience and Disaster Recovery
+
+Design first for Availability Zone failures inside one Region, then add a warm secondary Region when the business impact justifies it. Define workload-specific recovery point objectives (RPOs) and recovery time objectives (RTOs) before selecting the replication and failover pattern; do not promise zero data loss from asynchronous replication.
+
+```mermaid
+flowchart LR
+    subgraph Primary["Primary AWS Region"]
+        PIngress["IoT / API Ingress"] --> PMSK["MSK Primary"]
+        PMSK --> PFlink["Managed Flink"]
+        PFlink --> PTopics["Curated Topics"]
+        PTopics --> PConnect["MSK Connect"]
+        PConnect --> PLake[("S3 Iceberg")]
+    end
+
+    subgraph Secondary["Warm Secondary AWS Region"]
+        SMSK["MSK Secondary"] --> SFlink["Managed Flink<br/>Standby Deployment"]
+        SFlink --> STopics["Curated Topics"]
+        STopics --> SConnect["MSK Connect<br/>Disabled Until Failover"]
+        SConnect --> SLake[("Recovered S3 Iceberg")]
+    end
+
+    PMSK -. "MSK Replicator<br/>asynchronous" .-> SMSK
+    PLake -. "S3 Cross-Region Replication<br/>objects, not atomic table failover" .-> SLake
+    IaC["Versioned IaC + Artifacts"] -.-> Secondary
+```
+
+### Recovery Strategy
+
+- Deploy MSK, Flink, connectors, IAM, networking, alarms, and catalog definitions from the same versioned infrastructure code in both Regions.
+- Use MSK Replicator to asynchronously copy selected topics and consumer-group offsets to the secondary MSK cluster. Validate permissions, topic configuration, and replication lag; for MSK-to-MSK replication, the source and target clusters must be in the same AWS account and supported Regions.
+- Enable S3 Versioning and Cross-Region Replication for raw evidence, connector plugins, Flink artifacts, runbooks, and lake data that must survive a regional loss. Replication status is part of the RPO dashboard.
+- Do not treat S3 replication as an atomic Iceberg-table failover mechanism: data files and metadata can arrive at different times. Promote only a validated complete snapshot, or rebuild derived Bronze/Silver/Gold tables from replicated raw objects and Kafka records. Raw evidence and curated topics are the recovery sources of truth.
+- Retain Managed Flink checkpoints for local recovery and service snapshots for controlled application updates. Test whether the chosen cross-Region recovery procedure can restore compatible state; otherwise replay from replicated Kafka offsets and reconcile by immutable event ID.
+- Keep the secondary Iceberg streaming writer disabled until ownership is transferred. This prevents two Regions from committing independently to the same logical table.
+- Recreate Glue Data Catalog and Lake Formation configuration through IaC or a tested metadata-recovery process. S3 object replication alone does not restore catalog registrations or permissions.
+- Route new ingress through a health-checked regional endpoint only after MSK, processing, writer ownership, catalog access, and reconciliation checks pass.
+
+### Failover Runbook
+
+1. Declare the incident and freeze automated remediation and nonessential dataset publication.
+2. Record primary MSK offsets, Iceberg snapshot IDs, replication lag, and the last successfully published Gold manifest.
+3. Stop or fence the primary Region's Iceberg writers when reachable.
+4. Confirm replicated topics, objects, schemas, encryption keys, catalog metadata, and service quotas in the secondary Region.
+5. Start the secondary Flink application from a validated snapshot or replay point; then enable exactly one Iceberg writer for each target-table group.
+6. Shift ingress gradually, monitor duplicate rate, lag, checkpoint health, and Iceberg commit failures, and run end-to-end reconciliation.
+7. Publish Gold data only after quality and completeness gates pass. Treat failback as another controlled migration rather than simply reversing DNS.
+
+Run quarterly recovery exercises covering an Availability Zone fault, a Flink restore, a corrupted deployment, and a full regional failover. Record measured RPO/RTO, data gaps, duplicates, recovery steps, and corrective actions.
+
+---
+
+## 17. Failure Modes and Recovery
 
 | Failure | Detection | Recovery |
 |---|---|---|
@@ -708,7 +825,7 @@ Do not publish SLO numbers until tests establish realistic values.
 
 ---
 
-## 17. Security and Multi-Account Governance
+## 18. Security and Multi-Account Governance
 
 ### Account Model
 
@@ -739,7 +856,7 @@ Raw vehicle or robotics data must never be placed directly into prompts or knowl
 
 ---
 
-## 18. Cost and Capacity Engineering
+## 19. Cost and Capacity Engineering
 
 ### Cost Drivers
 
@@ -766,7 +883,7 @@ Raw vehicle or robotics data must never be placed directly into prompts or knowl
 
 ---
 
-## 19. Deployment and Infrastructure as Code
+## 20. Deployment and Infrastructure as Code
 
 ```mermaid
 flowchart LR
@@ -825,7 +942,7 @@ aws-native-autonomy-data-platform/
 
 ---
 
-## 20. Practical Implementation Plan
+## 21. Practical Implementation Plan
 
 ### Phase 1 — AWS-Native Vertical Slice
 
@@ -871,11 +988,24 @@ aws-native-autonomy-data-platform/
 - Inject producer, consumer, checkpoint, and sink failures.
 - Document recovery behavior and data reconciliation.
 
+### Production Release Gates
+
+A release is eligible for production only when all applicable gates have recorded evidence:
+
+1. **Contract:** backward/forward compatibility policy passes and an incompatible-schema test reaches quarantine.
+2. **Replay:** the same input is replayed without duplicate business records or multiple Gold publications.
+3. **Recovery:** Flink restores from a checkpoint/snapshot and the Iceberg writer recovers from a terminated commit attempt.
+4. **Load:** sustained throughput, P99 freshness, consumer lag, checkpoint duration, file size, and cost remain inside approved envelopes.
+5. **Reconciliation:** raw-object manifests, Kafka offsets, Silver rows, and Gold manifests agree within a documented tolerance.
+6. **Security:** least-privilege access, encryption, secret rotation, network isolation, audit logging, and sensitive-data controls pass review.
+7. **Disaster recovery:** a game day demonstrates the approved RPO/RTO and single-writer transfer in the secondary Region.
+8. **Rollback:** application, connector, schema, and infrastructure versions have a tested rollback or forward-fix procedure.
+
 > Never claim **1M+ records/second** or petabyte-scale production throughput without a reproducible benchmark and a clear distinction between architecture capacity, test results, and actual production operation.
 
 ---
 
-## 21. Decision Summary
+## 22. Decision Summary
 
 ### Recommended Production Pattern
 
@@ -910,7 +1040,7 @@ IoT Core or API Gateway
 
 ---
 
-## 22. Official AWS References
+## 23. Official AWS References
 
 - [Amazon MSK documentation](https://docs.aws.amazon.com/msk/)
 - [Use MSK Serverless clusters](https://docs.aws.amazon.com/msk/latest/developerguide/serverless-getting-started.html)
@@ -919,6 +1049,9 @@ IoT Core or API Gateway
 - [Glue Schema Registry integrations with MSK and Managed Flink](https://docs.aws.amazon.com/glue/latest/dg/schema-registry-integrations.html)
 - [Amazon MSK Connect concepts](https://docs.aws.amazon.com/msk/latest/developerguide/msk-connect-connectors.html)
 - [Deliver data to Iceberg tables with Amazon Data Firehose](https://docs.aws.amazon.com/firehose/latest/dev/apache-iceberg-destination.html)
+- [Data Firehose Iceberg considerations and limitations](https://docs.aws.amazon.com/firehose/latest/dev/apache-iceberg-considerations.html)
+- [Managed Service for Apache Flink fault tolerance](https://docs.aws.amazon.com/managed-flink/latest/java/how-fault.html)
+- [Amazon MSK Replicator](https://docs.aws.amazon.com/msk/latest/developerguide/msk-replicator.html)
 - [Using Apache Iceberg with EMR Serverless](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/using-iceberg.html)
 - [EMR Serverless streaming jobs](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/jobs-streaming.html)
 - [AWS Glue Data Quality](https://docs.aws.amazon.com/glue/latest/dg/glue-data-quality.html)
