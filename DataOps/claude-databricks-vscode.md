@@ -4,7 +4,7 @@
 
 **Focus areas:** Develop · Explore · Build · Execute · Govern · Scale
 
-Source diagram: [alexeyban/databricks-lab](https://github.com/alexeyban/databricks-lab)
+Source diagram: [superdba111/databricks-lab](https://github.com/superdba111/databricks-lab)
 
 ![Claude Code + Databricks + VS Code architecture diagram](architecture-diagram.png)
 
