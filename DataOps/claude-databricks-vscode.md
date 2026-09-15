@@ -10,6 +10,8 @@ Source diagram: [superdba111/databricks-lab](https://github.com/superdba111/data
 
 ## Overview
 
+The data engineer and platform role has changed. Building a pipeline, handing it off, and waiting for someone else to confirm the data is right no longer creates much value. The engineers who matter now go deep into the business domain, understand the problem directly, and use AI tools to move from question to working solution in hours rather than sprints.
+
 This page describes an end-to-end architecture for integrating **Claude Code** into a **Databricks** development workflow — from the developer environment and project configuration, through workspace execution, to a Medallion-based data pipeline.
 
 The architecture keeps a clear separation of responsibilities:
