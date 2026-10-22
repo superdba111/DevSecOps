@@ -25,79 +25,79 @@ Design a large-scale event-driven platform that ingests industrial sensor and op
 
 ```mermaid
 flowchart TB
-    subgraph EDGE[Industrial edge and ingestion]
-        DEV[IoT sensors / drones / robots]
-        GW[Edge gateway / AWS IoT Core<br/>Device auth, buffering, protocol translation]
-        DEV -->|MQTT / HTTPS / gRPC; Protobuf / Avro| GW
+    subgraph EDGE["Industrial edge and ingestion"]
+        DEV["IoT sensors, drones and robots"]
+        GW["Edge gateway and AWS IoT Core - authentication and buffering"]
+        DEV -->|"MQTT, HTTPS or gRPC"| GW
     end
 
-    GW -->|Validated transport; device_id key| STREAM[(Kinesis Data Streams<br/>or Amazon MSK / Kafka)]
-    SCHEMA[Schema registry / data contracts<br/>versioned Protobuf or Avro]
+    GW -->|"Partition key: device_id"| STREAM[("Kinesis Data Streams or Amazon MSK")]
+    SCHEMA["Schema registry - versioned Protobuf or Avro"]
     SCHEMA -.-> GW
     SCHEMA -.-> STREAM
 
-    subgraph HOT[HOT PATH — low-latency prediction]
-        FLINK[Apache Flink on EKS<br/>Flink Kubernetes Operator<br/>source → parse → validate → dedup]
-        STATE[(Flink keyed state<br/>keyBy(device_id); rolling features)]
-        META[(DynamoDB / Redis OPTIONAL<br/>device metadata, shared online features)]
-        SERVE[Real-time model endpoint<br/>Databricks Model Serving / SageMaker / EKS]
-        RESULT[(Durable prediction results stream<br/>Kinesis or Kafka topic)]
+    subgraph HOT["Hot path - near-real-time inference"]
+        FLINK["Apache Flink on EKS - parse, validate, deduplicate"]
+        STATE["Flink keyed state - keyBy device_id, rolling features"]
+        META[("Optional DynamoDB or Redis - metadata and shared features")]
+        SERVE["Model Serving - Databricks, SageMaker or EKS"]
+        RESULT[("Durable prediction results - Kinesis or Kafka")]
         FLINK --> STATE
-        STATE -->|Async inference, bounded concurrency| SERVE
-        META -.->|Optional asynchronous lookup| STATE
-        SERVE -->|Prediction + model version + event_id| RESULT
+        STATE -->|"Bounded asynchronous inference"| SERVE
+        META -.->|"Optional feature lookup"| STATE
+        SERVE -->|"Prediction, model version and event ID"| RESULT
     end
 
-    STREAM -->|Independent source consumer| FLINK
+    STREAM -->|"Independent consumer"| FLINK
 
-    subgraph LAKE[LAKE PATH — independent analytical consumer]
-        DBX[Databricks Structured Streaming<br/>schema validation + data quality]
-        BRONZE[(S3 + Delta Bronze<br/>raw payload / ingest metadata)]
-        SILVER[(S3 + Delta Silver<br/>typed, deduplicated, validated)]
-        GOLD[(S3 + Delta Gold<br/>curated features / training datasets)]
+    subgraph LAKE["Lake path - independent analytics consumer"]
+        DBX["Databricks Structured Streaming - data quality"]
+        BRONZE[("S3 Delta Bronze - raw payloads")]
+        SILVER[("S3 Delta Silver - validated data")]
+        GOLD[("S3 Delta Gold - training features")]
         DBX --> BRONZE --> SILVER --> GOLD
     end
-    STREAM -->|Separate consumer / consumer group| DBX
+    STREAM -->|"Separate consumer"| DBX
 
-    subgraph MLOPS[ML development / model lifecycle]
-        TRAIN[Databricks training / evaluation<br/>Argo Workflows or Databricks Jobs]
-        MLFLOW[MLflow tracking + Model Registry<br/>approved model version]
+    subgraph MLOPS["ML development lifecycle"]
+        TRAIN["Databricks training and evaluation - Argo or Jobs"]
+        MLFLOW["MLflow tracking and Model Registry"]
         TRAIN --> MLFLOW
     end
     GOLD --> TRAIN
-    MLFLOW -.->|Versioned deployment / canary / rollback| SERVE
+    MLFLOW -.->|"Approved model deployment and rollback"| SERVE
 
-    subgraph DELIVERY[Downstream integration — independent reliability domain]
-        ROUTE[Alert processor + idempotency<br/>incident state / dedup]
-        BUS[EventBridge rules / SQS fan-out]
-        MAINT[Maintenance ticket API]
-        DASH[Dashboard / device status API]
-        PARTNER[External integration / webhook]
-        DLQ[(DLQ + replay / reconciliation)]
+    subgraph DELIVERY["Downstream reliable integrations"]
+        ROUTE["Alert processor - incident deduplication"]
+        BUS["EventBridge routing and SQS queues"]
+        MAINT["Maintenance ticket API"]
+        DASH["Dashboard and status API"]
+        PARTNER["External webhook and partner API"]
+        DLQ[("Dead-letter queue and reconciliation")]
         ROUTE --> BUS
-        BUS -->|Queue + worker; retry| MAINT
-        BUS -->|Queue + worker| DASH
-        BUS -->|Queue + worker; backoff| PARTNER
-        BUS -->|Poison/exhausted deliveries| DLQ
+        BUS -->|"Queue worker and retries"| MAINT
+        BUS -->|"Queue worker"| DASH
+        BUS -->|"Queue worker and backoff"| PARTNER
+        BUS -->|"Exhausted deliveries"| DLQ
     end
     RESULT --> ROUTE
-    ROUTE -->|Latest prediction/status| META
+    ROUTE -->|"Latest device status"| META
 
-    S3CP[(S3 Flink checkpoints / savepoints)]
-    FLINK -.->|State recovery| S3CP
-    OPS[Cross-cutting: Terraform, IAM/Pod Identity, TLS/KMS,<br/>CloudWatch/Datadog, traces, alerting, SLO dashboards]
+    S3CP[("S3 checkpoints and savepoints")]
+    FLINK -.->|"Checkpoint and restore"| S3CP
+    OPS["Terraform, IAM, encryption, observability and SLOs"]
     OPS -.-> FLINK
     OPS -.-> DBX
     OPS -.-> ROUTE
 
-    classDef stream fill:#d5eee4,stroke:#33836c,color:#174b3c;
-    classDef compute fill:#e4e4fb,stroke:#7665b5,color:#302764;
-    classDef store fill:#dfeeff,stroke:#5487be,color:#1f4573;
-    classDef ml fill:#f9e8d4,stroke:#bf8744,color:#72440f;
-    class STREAM,RESULT stream;
-    class FLINK,DBX,GW,ROUTE,BUS compute;
-    class BRONZE,SILVER,GOLD,S3CP,META,DLQ store;
-    class SERVE,TRAIN,MLFLOW ml;
+    classDef stream fill:#d5eee4,stroke:#33836c,color:#174b3c
+    classDef compute fill:#e4e4fb,stroke:#7665b5,color:#302764
+    classDef store fill:#dfeeff,stroke:#5487be,color:#1f4573
+    classDef ml fill:#f9e8d4,stroke:#bf8744,color:#72440f
+    class STREAM,RESULT stream
+    class FLINK,DBX,GW,ROUTE,BUS compute
+    class BRONZE,SILVER,GOLD,S3CP,META,DLQ store
+    class SERVE,TRAIN,MLFLOW ml
 ```
 
 **How to read this:** The two solid branches out of the ingestion stream are *independent consumers*. No Databricks job is synchronously required for a prediction. The dashed arrows are control-plane, optional lookup, deployment, or recovery relationships; they are not necessarily per-event calls. The diagram is conceptual: choose *one* primary streaming backbone first (Kinesis or MSK), not both without a clear reason.
